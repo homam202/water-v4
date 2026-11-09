@@ -39,18 +39,29 @@ jobs:
           cp /tmp/pubspec_backup.yaml pubspec.yaml
           rm -rf test
 
-      - name: Add Bluetooth permissions
+      - name: Add Bluetooth permissions and Google Maps key
+        env:
+          MAPS_API_KEY: ${{ secrets.MAPS_API_KEY }}
         run: |
           python3 - <<'PY'
+          import os, re
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p).read()
           perms = '''<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
               '''
           s = s.replace('<application', perms + '<application', 1)
+          key = os.environ.get('MAPS_API_KEY', '').strip()
+          if key:
+              meta = '<meta-data android:name="com.google.android.geo.API_KEY" android:value="' + key + '"/>'
+              s = re.sub(r'(<application[^>]*>)', lambda m: m.group(1) + '\n        ' + meta, s, count=1)
+              print('Google Maps key added to manifest')
+          else:
+              print('No MAPS_API_KEY secret: GPS map will use the offline view')
           open(p, 'w').write(s)
           PY
 
@@ -105,7 +116,9 @@ jobs:
         run: dart run flutter_launcher_icons
 
       - name: Build release APK
-        run: flutter build apk --release
+        env:
+          HAS_KEY: ${{ secrets.MAPS_API_KEY != '' }}
+        run: flutter build apk --release --dart-define=HAS_MAPS_KEY=$HAS_KEY
 
       - uses: actions/upload-artifact@v4
         with:
