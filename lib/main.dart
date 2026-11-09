@@ -1,28 +1,26 @@
-// GeoPulse v1.1 - TEFSM groundwater survey viewer (ESP32 over BLE)
-// Arabic / English, CSV import, tap-to-inspect heatmap, zone analysis, share image
+// GeoPulse v1.3 - TEFSM groundwater survey viewer (ESP32 over BLE)
+// Isolate parsing, LTTB downsampling, OSM map, estimated soil resistivity, dynamic depth
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:csv/csv.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show Factory;
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:flutter_map/flutter_map.dart'
+    show FlutterMap, MapOptions, TileLayer, MarkerLayer, Marker, PolylineLayer, Polyline;
+import 'package:latlong2/latlong.dart' show LatLng;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-
-// Set by the build (--dart-define=HAS_MAPS_KEY=true) when a Google Maps API key is configured.
-const bool hasMapsKey = bool.fromEnvironment('HAS_MAPS_KEY');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -99,11 +97,15 @@ const Map<String, Map<String, String>> _tr = {
     'soil_granite': 'صخر صلب (جرانيت/بازلت)',
     'soil_custom': 'قيمة مخصصة',
     'rho_title': 'المقاومية (Ω·m)',
-    'depth_note': 'العمق تقريبي (معادلة بوستيك) ويتغير بحسب مقاومية التربة. للدقة عاير على بئر معروفة العمق.',
+    'depth_note': 'العمق التقريبي = 500 × √(المقاومية ÷ التردد). تُقدَّر المقاومية تلقائياً من تخامد الإشارة، ويمكنك اختيار نوع التربة يدوياً. للدقة عاير على بئر معروفة العمق.',
     'm_unit': 'م',
     'soil_average': 'متوسط',
+    'soil_auto': 'تلقائي (مقدّر من الإشارة)',
+    'est_soil': 'التربة المقدّرة: {r} Ω·m',
+    'manual_used': 'المستخدم في حساب العمق (يدوي): {r} Ω·m',
+    'processing': 'جارٍ المعالجة...',
     'view_heat': 'الخريطة الحرارية',
-    'view_gps': 'خريطة GPS',
+    'view_gps': 'عرض الخريطة',
     'no_maps_key': 'مفتاح Google Maps غير مضاف، لذلك تظهر مواقع النقاط بدون خلفية خريطة.',
     'zoom_hint': 'اقرص بإصبعين للتكبير، واسحب للتحريك',
     'reset_zoom': 'إعادة الضبط',
@@ -185,11 +187,15 @@ const Map<String, Map<String, String>> _tr = {
     'soil_granite': 'Hard rock (granite/basalt)',
     'soil_custom': 'Custom value',
     'rho_title': 'Resistivity (Ω·m)',
-    'depth_note': 'Depth is approximate (Bostick formula) and depends on soil resistivity. For accuracy, calibrate on a well of known depth.',
+    'depth_note': 'Approx. depth = 500 × √(resistivity ÷ frequency). Resistivity is estimated automatically from signal attenuation; you can also pick a soil type manually. For accuracy, calibrate on a well of known depth.',
     'm_unit': 'm',
     'soil_average': 'Average',
+    'soil_auto': 'Auto (estimated from signal)',
+    'est_soil': 'Estimated Soil: {r} Ω·m',
+    'manual_used': 'Used for depth (manual): {r} Ω·m',
+    'processing': 'Processing...',
     'view_heat': 'Heatmap',
-    'view_gps': 'GPS map',
+    'view_gps': 'Map view',
     'no_maps_key': 'No Google Maps key configured, so site points are shown without a map background.',
     'zoom_hint': 'Pinch to zoom, drag to pan',
     'reset_zoom': 'Reset',
@@ -357,16 +363,72 @@ class Zone {
   Zone(this.si, this.fi, this.v);
 }
 
+/// Largest-Triangle-Three-Buckets: indices of `target` points of the series
+/// (x = index, y = ys[i]) that best preserve its visual shape. First and last are kept.
+List<int> lttbIndices(List<double> ys, int target) {
+  final n = ys.length;
+  if (target >= n || target < 3) return List.generate(n, (i) => i);
+  final out = <int>[0];
+  final every = (n - 2) / (target - 2);
+  var a = 0;
+  for (var i = 0; i < target - 2; i++) {
+    final avgStart = ((i + 1) * every).floor() + 1;
+    var avgEnd = ((i + 2) * every).floor() + 1;
+    if (avgEnd > n) avgEnd = n;
+    var avgX = 0.0, avgY = 0.0;
+    final cnt = avgEnd - avgStart;
+    if (cnt > 0) {
+      for (var j = avgStart; j < avgEnd; j++) {
+        avgX += j;
+        avgY += ys[j];
+      }
+      avgX /= cnt;
+      avgY /= cnt;
+    } else {
+      avgX = (n - 1).toDouble();
+      avgY = ys[n - 1];
+    }
+    final rs = (i * every).floor() + 1;
+    final re = ((i + 1) * every).floor() + 1;
+    var maxArea = -1.0;
+    var next = rs;
+    for (var j = rs; j < re && j < n; j++) {
+      final area = ((a - avgX) * (ys[j] - ys[a]) - (a - j) * (avgY - ys[a])).abs() * 0.5;
+      if (area > maxArea) {
+        maxArea = area;
+        next = j;
+      }
+    }
+    out.add(next);
+    a = next;
+  }
+  out.add(n - 1);
+  return out;
+}
+
 class SurveyData {
   final int line;
-  final List<int> sites; // X axis
-  final List<double> freqs; // Y axis ascending (row 0 = lowest freq = deepest)
+  final List<int> sites;
+  final List<double> freqs; // ascending (row 0 = lowest freq = deepest)
   final List<List<double>> matrix; // matrix[freqIndex][siteIndex] = mV
   final Map<int, List<double>> gps; // site -> [lat, lon] (optional)
   final double min, max, mean;
-  SurveyData(this.line, this.sites, this.freqs, this.matrix, this.gps, this.min, this.max, this.mean);
+  final double rho; // estimated soil resistivity (ohm.m) from signal attenuation
+  SurveyData(this.line, this.sites, this.freqs, this.matrix, this.gps, this.min, this.max, this.mean, this.rho);
 
   bool get hasGps => gps.isNotEmpty;
+
+  /// Heuristic: ratio = V_high / V_low (average voltage at highest / lowest frequency),
+  /// resistivity = 100 * (1 / ratio), clamped to 10..1000 ohm.m.
+  static double estimateRho(List<List<double>> m) {
+    if (m.isEmpty) return 100;
+    double avg(List<double> r) => r.reduce((a, b) => a + b) / r.length;
+    final low = avg(m.first), high = avg(m.last);
+    if (high.abs() < 1e-9) return 1000;
+    final ratio = high / low; // low == 0 -> infinity -> 10
+    if (ratio.abs() < 1e-9) return 1000;
+    return (100 * (1 / ratio)).abs().clamp(10.0, 1000.0).toDouble();
+  }
 
   /// Accepts both:  Line,Site,Frequency,Voltage
   ///          and:  Line,Site,Latitude,Longitude,Frequency,Voltage
@@ -405,7 +467,8 @@ class SurveyData {
         if (!gps.containsKey(s)) gps[s] = [lat.toDouble(), lon.toDouble()];
       }
     }
-    if (vals.isEmpty) throw Exception(tr('no_rows'));
+    // thrown inside an isolate: keep it a plain code, translated on the UI side
+    if (vals.isEmpty) throw const FormatException('no_rows');
     final sites = siteSet.toList()..sort();
     final freqs = freqSet.toList()..sort();
     final m = List.generate(
@@ -420,7 +483,32 @@ class SurveyData {
       }
     }
     return SurveyData(lineNo ?? fallbackLine, sites, freqs, m, gps, all.reduce(math.min),
-        all.reduce(math.max), mean);
+        all.reduce(math.max), mean, estimateRho(m));
+  }
+
+  /// If rows*cols > maxPoints, keep the rows/columns picked by LTTB (on the mean profiles)
+  /// plus the cells of [keep] (the strongest anomalies), so the "shape" of the anomaly survives.
+  SurveyData downsample(int maxPoints, {List<Zone> keep = const []}) {
+    final rows = freqs.length, cols = sites.length;
+    if (rows * cols <= maxPoints) return this;
+    final f = math.sqrt(maxPoints / (rows * cols));
+    final tCols = math.max(3, (cols * f).round());
+    final tRows = math.max(3, (rows * f).round());
+    final colProfile = List.generate(cols, (c) {
+      var s = 0.0;
+      for (var r = 0; r < rows; r++) {
+        s += matrix[r][c];
+      }
+      return s / rows;
+    });
+    final rowProfile = List.generate(rows, (r) => matrix[r].reduce((a, b) => a + b) / cols);
+    final ci = <int>{...lttbIndices(colProfile, tCols), ...keep.map((z) => z.si)}.toList()..sort();
+    final ri = <int>{...lttbIndices(rowProfile, tRows), ...keep.map((z) => z.fi)}.toList()..sort();
+    final nm = [
+      for (final r in ri) [for (final c in ci) matrix[r][c]]
+    ];
+    return SurveyData(line, [for (final c in ci) sites[c]], [for (final r in ri) freqs[r]], nm, gps, min,
+        max, mean, rho);
   }
 
   /// Lowest-voltage cells that are not neighbours of each other.
@@ -464,9 +552,8 @@ const Map<String, double> soilRho = {
   'granite': 1000,
 };
 
-/// Bostick approximate depth in metres: depthCoef * sqrt(rho / f).
-/// Change depthCoef to 500 if you prefer the simpler empirical formula.
-const double depthCoef = 356;
+/// Approximate depth in metres: Depth = 500 * sqrt(resistivity / frequency).
+const double depthCoef = 500;
 double postickDepth(double rho, double freq) => depthCoef * math.sqrt(rho / freq);
 
 // ───────────────────────── COLOR + INTERPOLATION ─────────────────────────
@@ -474,6 +561,15 @@ Color coolwarm(double t) {
   t = t.clamp(0.0, 1.0);
   const c0 = Color(0xFF3B4CC0), c1 = Color(0xFFDDDDDD), c2 = Color(0xFFB40426);
   return t < 0.5 ? Color.lerp(c0, c1, t * 2)! : Color.lerp(c1, c2, (t - 0.5) * 2)!;
+}
+
+/// coolwarm as plain RGB ints (used for pixel buffers built inside isolates)
+List<int> coolwarmRgb(double t) {
+  t = t.clamp(0.0, 1.0).toDouble();
+  const c0 = [0x3B, 0x4C, 0xC0], c1 = [0xDD, 0xDD, 0xDD], c2 = [0xB4, 0x04, 0x26];
+  final a = t < 0.5 ? c0 : c1, b = t < 0.5 ? c1 : c2;
+  final u = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+  return [for (var i = 0; i < 3; i++) (a[i] + (b[i] - a[i]) * u).round()];
 }
 
 double bilinear(List<List<double>> m, double x, double y) {
@@ -507,12 +603,13 @@ void drawText(Canvas c, String s, Offset o,
 
 class HeatmapPainter extends CustomPainter {
   final SurveyData data;
+  final ui.Image? image; // pre-rendered (interpolated) heat image, built in an isolate
   final bool smooth;
   final int? selSi, selFi;
   final double rho;
   final Zone? target;
   final String lang = appLang;
-  HeatmapPainter(this.data, this.smooth, this.selSi, this.selFi, this.rho, {this.target});
+  HeatmapPainter(this.data, this.image, this.smooth, this.selSi, this.selFi, this.rho, {this.target});
 
   static Rect plotRect(Size s) => Rect.fromLTRB(46, 8, s.width - 54, s.height - 30);
 
@@ -530,28 +627,16 @@ class HeatmapPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    const step = 3.0;
     final plot = plotRect(size);
     final rows = data.freqs.length, cols = data.sites.length;
-    final range = (data.max - data.min).abs() < 1e-9 ? 1.0 : data.max - data.min;
-    final p = Paint();
-
-    for (double py = 0; py < plot.height; py += step) {
-      for (double px = 0; px < plot.width; px += step) {
-        var gx = cols == 1 ? 0.0 : (px + step / 2) / plot.width * (cols - 1);
-        // Y inverted: top of the plot = highest frequency, row 0 (lowest freq) at the bottom
-        var gy = rows == 1 ? 0.0 : (plot.height - py - step / 2) / plot.height * (rows - 1);
-        if (!smooth) {
-          gx = gx.roundToDouble();
-          gy = gy.roundToDouble();
-        }
-        final v = bilinear(data.matrix, gx, gy);
-        p.color = coolwarm((v - data.min) / range);
-        canvas.drawRect(
-            Rect.fromLTWH(plot.left + px, plot.top + py, math.min(step, plot.width - px) + 0.5,
-                math.min(step, plot.height - py) + 0.5),
-            p);
-      }
+    final img = image;
+    if (img != null) {
+      canvas.drawImageRect(
+        img,
+        Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+        plot,
+        Paint()..filterQuality = smooth ? FilterQuality.medium : FilterQuality.none,
+      );
     }
     canvas.drawRect(plot, Paint()..style = PaintingStyle.stroke..color = Colors.black54);
 
@@ -617,6 +702,7 @@ class HeatmapPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant HeatmapPainter old) =>
       old.data != data ||
+      old.image != image ||
       old.smooth != smooth ||
       old.selSi != selSi ||
       old.selFi != selFi ||
@@ -626,68 +712,9 @@ class HeatmapPainter extends CustomPainter {
       old.lang != lang;
 }
 
-/// Offline fallback for the GPS view: site positions coloured by their lowest voltage.
-class GpsScatterPainter extends CustomPainter {
-  final SurveyData d;
-  GpsScatterPainter(this.d);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFFEFF3F1));
-    if (d.gps.isEmpty) return;
-    final lat0 = d.gps.values.map((g) => g[0]).reduce((a, b) => a + b) / d.gps.length;
-    final k = math.cos(lat0 * math.pi / 180);
-    var minX = double.infinity, maxX = -double.infinity;
-    var minY = double.infinity, maxY = -double.infinity;
-    for (final g in d.gps.values) {
-      final x = g[1] * k, y = g[0];
-      minX = math.min(minX, x);
-      maxX = math.max(maxX, x);
-      minY = math.min(minY, y);
-      maxY = math.max(maxY, y);
-    }
-    final w = maxX - minX, h = maxY - minY;
-    const pad = 34.0;
-    final sc = (w < 1e-9 && h < 1e-9)
-        ? 1.0
-        : math.min((size.width - 2 * pad) / math.max(w, 1e-9), (size.height - 2 * pad) / math.max(h, 1e-9));
-    final ox = (size.width - w * sc) / 2, oy = (size.height - h * sc) / 2;
-    Offset at(List<double> g) =>
-        Offset(ox + (g[1] * k - minX) * sc, size.height - (oy + (g[0] - minY) * sc));
-
-    final range = (d.max - d.min).abs() < 1e-9 ? 1.0 : d.max - d.min;
-    final path = Path();
-    var first = true;
-    for (var si = 0; si < d.sites.length; si++) {
-      final g = d.gps[d.sites[si]];
-      if (g == null) continue;
-      final o = at(g);
-      if (first) {
-        path.moveTo(o.dx, o.dy);
-        first = false;
-      } else {
-        path.lineTo(o.dx, o.dy);
-      }
-    }
-    canvas.drawPath(path, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = Colors.black26);
-    for (var si = 0; si < d.sites.length; si++) {
-      final g = d.gps[d.sites[si]];
-      if (g == null) continue;
-      final o = at(g);
-      final z = d.siteMin(si);
-      canvas.drawCircle(o, 11, Paint()..color = coolwarm((z.v - d.min) / range));
-      canvas.drawCircle(o, 11, Paint()..style = PaintingStyle.stroke..color = Colors.black54);
-      drawText(canvas, '${d.sites[si]}', o, centerX: true, centerY: true, size: 10, weight: FontWeight.bold);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant GpsScatterPainter old) => old.d != d;
-}
-
 class ColorBarLegend extends StatelessWidget {
-  final SurveyData data;
-  const ColorBarLegend({super.key, required this.data});
+  final double min, max;
+  const ColorBarLegend({super.key, required this.min, required this.max});
   @override
   Widget build(BuildContext context) {
     // Gradient is always left=blue, right=red, so keep this block left-to-right.
@@ -703,8 +730,8 @@ class ColorBarLegend extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-          Text('${data.min.toStringAsFixed(1)} mV', style: const TextStyle(color: Colors.black87)),
-          Text('${data.max.toStringAsFixed(1)} mV', style: const TextStyle(color: Colors.black87)),
+          Text('${min.toStringAsFixed(1)} mV', style: const TextStyle(color: Colors.black87)),
+          Text('${max.toStringAsFixed(1)} mV', style: const TextStyle(color: Colors.black87)),
         ]),
         const SizedBox(height: 6),
         Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
@@ -725,7 +752,8 @@ class Volume3D {
   final List<double> freqs;
   final List<List<List<double>>> v;
   final double min, max;
-  Volume3D(this.sites, this.freqs, this.lines, this.v, this.min, this.max);
+  final double rho; // estimated soil resistivity for the whole volume
+  Volume3D(this.sites, this.freqs, this.lines, this.v, this.min, this.max, this.rho);
 
   static Volume3D build(List<SurveyData> sets) {
     final sorted = [...sets]..sort((a, b) => a.line.compareTo(b.line));
@@ -753,7 +781,49 @@ class Volume3D {
       });
       v.add(grid);
     }
-    return Volume3D(sites, freqs, sorted.map((s) => s.line).toList(), v, mn, mx);
+    final lowVals = <double>[], highVals = <double>[];
+    for (final g in v) {
+      lowVals.addAll(g.first);
+      highVals.addAll(g.last);
+    }
+    final rho = SurveyData.estimateRho([lowVals, highVals]);
+    return Volume3D(sites, freqs, sorted.map((s) => s.line).toList(), v, mn, mx, rho);
+  }
+
+  /// LTTB downsampling of the Site and Frequency axes when S*F*L > maxPoints.
+  Volume3D downsample(int maxPoints) {
+    final s = sites.length, f = freqs.length, l = v.length;
+    if (s * f * l <= maxPoints) return this;
+    final g = math.sqrt(maxPoints / (s * f * l));
+    final tS = math.max(3, (s * g).round()), tF = math.max(3, (f * g).round());
+    final sp = List.generate(s, (x) {
+      var a = 0.0;
+      for (var z = 0; z < l; z++) {
+        for (var y = 0; y < f; y++) {
+          a += v[z][y][x];
+        }
+      }
+      return a / (l * f);
+    });
+    final fp = List.generate(f, (y) {
+      var a = 0.0;
+      for (var z = 0; z < l; z++) {
+        for (var x = 0; x < s; x++) {
+          a += v[z][y][x];
+        }
+      }
+      return a / (l * s);
+    });
+    final low = lowestCell();
+    final xi = <int>{...lttbIndices(sp, tS), low[2]}.toList()..sort();
+    final yi = <int>{...lttbIndices(fp, tF), low[1]}.toList()..sort();
+    final nv = [
+      for (var z = 0; z < l; z++)
+        [
+          for (final y in yi) [for (final x in xi) v[z][y][x]]
+        ]
+    ];
+    return Volume3D([for (final x in xi) sites[x]], [for (final y in yi) freqs[y]], lines, nv, min, max, rho);
   }
 
   /// Trilinear sample at fractional index coordinates.
@@ -787,20 +857,20 @@ class Volume3D {
   }
 }
 
-/// Voxel cloud built from the 3D matrix: world coordinates + normalised value (0 = lowest voltage).
+/// Voxel cloud stored in (z, y, x) order (x fastest): world coordinates + normalised value.
 class VolumeGrid {
   static const double sx = 1.6, sy = 1.0, sz = 1.2; // box size in world units
   final Float32List xs, ys, zs, ts;
-  final int count;
+  final int count, nx, ny, nz;
   final double cell;
-  VolumeGrid(this.xs, this.ys, this.zs, this.ts, this.count, this.cell);
+  VolumeGrid(this.xs, this.ys, this.zs, this.ts, this.count, this.cell, this.nx, this.ny, this.nz);
 
   static VolumeGrid fromVolume(Volume3D vol) {
     final s = vol.sites.length, f = vol.freqs.length, l = vol.lines.length;
     int dim(int n, int k) => n <= 1 ? 1 : (n - 1) * k + 1;
     var k = 4, kz = l <= 1 ? 1 : 6;
     int total() => dim(s, k) * dim(f, k) * dim(l, kz);
-    while (total() > 30000 && (k > 1 || kz > 1)) {
+    while (total() > 20000 && (k > 1 || kz > 1)) {
       if (k > 1) {
         k--;
       } else {
@@ -827,12 +897,12 @@ class VolumeGrid {
         }
       }
     }
-    return VolumeGrid(xs, ys, zs, ts, n, math.max(sx / nx, sy / ny));
+    return VolumeGrid(xs, ys, zs, ts, n, math.max(sx / nx, sy / ny), nx, ny, nz);
   }
 }
 
-/// Renders the semi-transparent block: voxels are sorted back-to-front and drawn as
-/// translucent squares. Low voltage (blue/water) is more opaque so it shows inside the block.
+/// Semi-transparent block. Voxels are drawn back-to-front by walking each grid axis in the
+/// direction given by the view (no per-frame sorting). Low voltage (blue/water) is more opaque.
 class Volume3DPainter extends CustomPainter {
   final VolumeGrid g;
   final Volume3D vol;
@@ -845,29 +915,32 @@ class Volume3DPainter extends CustomPainter {
     final scale = math.min(size.width, size.height) * 0.36 * zoom;
     final cy = math.cos(yaw), sy = math.sin(yaw), cp = math.cos(pitch), sp = math.sin(pitch);
 
-    final n = g.count;
-    final px = Float32List(n), py = Float32List(n), dp = Float32List(n);
-    final order = <int>[];
-    for (var i = 0; i < n; i++) {
-      if (g.ts[i] > cutoff) continue;
-      final x = g.xs[i], y = g.ys[i], z = g.zs[i];
-      final x1 = x * cy + z * sy;
-      final z1 = -x * sy + z * cy;
-      final y2 = y * cp - z1 * sp;
-      final z2 = y * sp + z1 * cp;
-      px[i] = c.dx + x1 * scale;
-      py[i] = c.dy - y2 * scale;
-      dp[i] = z2;
-      order.add(i);
-    }
-    order.sort((a, b) => dp[a].compareTo(dp[b])); // far first
+    // depth = kx*x + ky*y + kz*z ; far-first means ascending depth along each axis
+    final kx = -sy * cp, ky = sp, kz = cy * cp;
+    int at(int j, int n, double k) => k >= 0 ? j : n - 1 - j;
+    final nx = g.nx, ny = g.ny, nz = g.nz;
     final s = math.max(2.0, scale * g.cell * 1.25);
     final paint = Paint();
-    for (final i in order) {
-      final t = g.ts[i];
-      final a = (opacity * (0.08 + 0.8 * math.pow(1 - t, 1.6))).clamp(0.0, 1.0);
-      paint.color = coolwarm(t).withAlpha((a * 255).round());
-      canvas.drawRect(Rect.fromCenter(center: Offset(px[i], py[i]), width: s, height: s), paint);
+    for (var jz = 0; jz < nz; jz++) {
+      final iz = at(jz, nz, kz);
+      for (var jy = 0; jy < ny; jy++) {
+        final iy = at(jy, ny, ky);
+        for (var jx = 0; jx < nx; jx++) {
+          final ix = at(jx, nx, kx);
+          final i = (iz * ny + iy) * nx + ix;
+          final t = g.ts[i];
+          if (t > cutoff) continue;
+          final x = g.xs[i], y = g.ys[i], z = g.zs[i];
+          final x1 = x * cy + z * sy;
+          final z1 = -x * sy + z * cy;
+          final y2 = y * cp - z1 * sp;
+          final a = (opacity * (0.08 + 0.8 * math.pow(1 - t, 1.6))).clamp(0.0, 1.0);
+          paint.color = coolwarm(t).withAlpha((a * 255).round());
+          canvas.drawRect(
+              Rect.fromCenter(center: Offset(c.dx + x1 * scale, c.dy - y2 * scale), width: s, height: s),
+              paint);
+        }
+      }
     }
 
     // bounding box + labels
@@ -912,6 +985,75 @@ class Volume3DPainter extends CustomPainter {
       old.rho != rho;
 }
 
+// ───────────────────────── BACKGROUND JOBS (run with Isolate.run) ─────────────────────────
+class HeatPixels {
+  final int w, h;
+  final Uint8List smooth, nearest; // RGBA buffers
+  HeatPixels(this.w, this.h, this.smooth, this.nearest);
+}
+
+class ParseResult {
+  final SurveyData data;
+  final HeatPixels heat;
+  ParseResult(this.data, this.heat);
+}
+
+class VolumeResult {
+  final Volume3D vol;
+  final VolumeGrid grid;
+  VolumeResult(this.vol, this.grid);
+}
+
+/// Bilinear-interpolated heat image (and a nearest-neighbour twin) as raw RGBA pixels.
+/// Row 0 of the matrix (lowest frequency = deepest) ends up at the BOTTOM of the image.
+HeatPixels buildHeatPixels(SurveyData d) {
+  final rows = d.freqs.length, cols = d.sites.length;
+  final w = (cols * 8).clamp(64, 400).toInt();
+  final h = (rows * 8).clamp(64, 400).toInt();
+  final range = (d.max - d.min).abs() < 1e-9 ? 1.0 : d.max - d.min;
+  Uint8List make(bool smooth) {
+    final out = Uint8List(w * h * 4);
+    for (var py = 0; py < h; py++) {
+      final gy = rows == 1 ? 0.0 : (h - 1 - py) / (h - 1) * (rows - 1);
+      for (var px = 0; px < w; px++) {
+        final gx = cols == 1 ? 0.0 : px / (w - 1) * (cols - 1);
+        final v = smooth ? bilinear(d.matrix, gx, gy) : d.matrix[gy.round()][gx.round()];
+        final rgb = coolwarmRgb((v - d.min) / range);
+        final o = (py * w + px) * 4;
+        out[o] = rgb[0];
+        out[o + 1] = rgb[1];
+        out[o + 2] = rgb[2];
+        out[o + 3] = 255;
+      }
+    }
+    return out;
+  }
+
+  return HeatPixels(w, h, make(true), make(false));
+}
+
+/// Everything heavy for the 2D map: read file, parse, estimate resistivity, LTTB, pixels.
+ParseResult parseFileJob(String path, int fallbackLine) {
+  var d = SurveyData.parse(File(path).readAsStringSync(), fallbackLine: fallbackLine);
+  d = d.downsample(5000, keep: d.bestZones(3));
+  return ParseResult(d, buildHeatPixels(d));
+}
+
+Future<ParseResult> runParseInIsolate(String path) => Isolate.run(() => parseFileJob(path, 1));
+
+/// Everything heavy for the 3D block: parse all files, build matrix, LTTB, voxel grid.
+VolumeResult volumeJob(List<String> paths) {
+  final sets = <SurveyData>[];
+  var idx = 1;
+  for (final p in paths) {
+    sets.add(SurveyData.parse(File(p).readAsStringSync(), fallbackLine: idx++));
+  }
+  final vol = Volume3D.build(sets).downsample(5000);
+  return VolumeResult(vol, VolumeGrid.fromVolume(vol));
+}
+
+Future<VolumeResult> runVolumeInIsolate(List<String> paths) => Isolate.run(() => volumeJob(paths));
+
 // ───────────────────────── APP STATE ─────────────────────────
 class AppState extends ChangeNotifier {
   final ble = BleService();
@@ -926,9 +1068,16 @@ class AppState extends ChangeNotifier {
   bool loadingList = false;
   File? currentFile;
   SurveyData? data;
-  String soilKey = 'average';
+  ui.Image? heatSmooth, heatNearest;
+  bool loadingMap = false, loadingVol = false;
+  VolumeGrid? volumeGrid;
+  String soilKey = 'auto'; // 'auto' = estimated from the signal
   double customRho = 100;
-  double get rho => soilKey == 'custom' ? customRho : (soilRho[soilKey] ?? 60);
+
+  /// Resistivity used for depth: estimated (auto) or the manually chosen soil.
+  double rhoFor(double autoRho) =>
+      soilKey == 'auto' ? autoRho : (soilKey == 'custom' ? customRho : (soilRho[soilKey] ?? 60));
+  double get rho => rhoFor(data?.rho ?? 50);
 
   String get soilLabel => soilKey == 'custom'
       ? '${tr('soil_custom')} ${customRho.toStringAsFixed(0)} Ω·m'
@@ -950,8 +1099,8 @@ class AppState extends ChangeNotifier {
     final saved = p.getString('lang');
     appLang = saved ?? 'ar';
     langNotifier.value = appLang;
-    final s = p.getString('soil') ?? 'average';
-    soilKey = (s == 'custom' || soilRho.containsKey(s)) ? s : 'average';
+    final s = p.getString('soil') ?? 'auto';
+    soilKey = (s == 'auto' || s == 'custom' || soilRho.containsKey(s)) ? s : 'auto';
     customRho = p.getDouble('rho') ?? 100;
   }
 
@@ -1102,29 +1251,54 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<ui.Image> _toImage(Uint8List px, int w, int h) {
+    final c = Completer<ui.Image>();
+    ui.decodeImageFromPixels(px, w, h, ui.PixelFormat.rgba8888, c.complete);
+    return c.future;
+  }
+
+  String friendlyErr(Object e) => e.toString().contains('no_rows') ? tr('no_rows') : errText(e);
+
+  /// Parsing, resistivity estimate, LTTB and pixel interpolation all run in a background isolate.
   Future<String?> buildVolume() async {
+    if (selected3d.isEmpty) return tr('need_files');
+    loadingVol = true;
+    notifyListeners();
     try {
-      if (selected3d.isEmpty) return tr('need_files');
-      final sets = <SurveyData>[];
-      var idx = 1;
-      for (final path in selected3d) {
-        sets.add(SurveyData.parse(await File(path).readAsString(), fallbackLine: idx++));
-      }
-      volume = Volume3D.build(sets);
-      notifyListeners();
-      return sets.length == 1 ? tr('one_line_warn') : null;
+      final paths = selected3d.toList();
+      final r = await runVolumeInIsolate(paths);
+      volume = r.vol;
+      volumeGrid = r.grid;
+      return paths.length == 1 ? tr('one_line_warn') : null;
     } catch (e) {
-      return errText(e);
+      return friendlyErr(e);
+    } finally {
+      loadingVol = false;
+      notifyListeners();
     }
   }
 
   Future<String?> generateMap() async {
+    final f = currentFile;
+    if (f == null) return null;
+    loadingMap = true;
+    notifyListeners();
     try {
-      data = SurveyData.parse(await currentFile!.readAsString());
-      notifyListeners();
+      final path = f.path;
+      final r = await runParseInIsolate(path);
+      final a = await _toImage(r.heat.smooth, r.heat.w, r.heat.h);
+      final b = await _toImage(r.heat.nearest, r.heat.w, r.heat.h);
+      heatSmooth?.dispose();
+      heatNearest?.dispose();
+      heatSmooth = a;
+      heatNearest = b;
+      data = r.data; // new file -> new estimated resistivity -> new depth labels
       return null;
     } catch (e) {
-      return errText(e);
+      return friendlyErr(e);
+    } finally {
+      loadingMap = false;
+      notifyListeners();
     }
   }
 }
@@ -1388,7 +1562,7 @@ class _MapPageState extends State<MapPage> {
   final _boundaryKey = GlobalKey();
   final _tc = TransformationController();
   bool smooth = true;
-  bool gpsView = false;
+  bool mapView = false;
   int? selSi, selFi;
   int _pointers = 0;
   bool _lock = false;
@@ -1405,7 +1579,7 @@ class _MapPageState extends State<MapPage> {
     super.dispose();
   }
 
-  // While two fingers are down (or the map is zoomed) the page must not scroll.
+  // While two fingers are down (or the view is zoomed) the page must not scroll.
   void _setLock(bool v) {
     if (_lock != v && mounted) setState(() => _lock = v);
   }
@@ -1499,20 +1673,12 @@ class _MapPageState extends State<MapPage> {
     }
   }
 
-  Widget _gpsWidget(SurveyData d) {
-    if (!hasMapsKey) {
-      return Column(children: [
-        Expanded(child: CustomPaint(size: Size.infinite, painter: GpsScatterPainter(d))),
-        Padding(
-          padding: const EdgeInsets.all(8),
-          child: Text(tr('no_maps_key'), style: Theme.of(context).textTheme.bodySmall),
-        ),
-      ]);
-    }
+  /// OpenStreetMap view (no API key). Markers: blue = low voltage (water), red = high (dry).
+  Widget _osmWidget(SurveyData d) {
     final range = (d.max - d.min).abs() < 1e-9 ? 1.0 : d.max - d.min;
-    final markers = <Marker>{};
     final pts = <LatLng>[];
-    var sumLat = 0.0, sumLon = 0.0;
+    final markers = <Marker>[];
+    var minLat = 90.0, maxLat = -90.0, minLon = 180.0, maxLon = -180.0;
     for (var si = 0; si < d.sites.length; si++) {
       final g = d.gps[d.sites[si]];
       if (g == null) continue;
@@ -1520,43 +1686,76 @@ class _MapPageState extends State<MapPage> {
       final t = ((z.v - d.min) / range).clamp(0.0, 1.0).toDouble();
       final pos = LatLng(g[0], g[1]);
       pts.add(pos);
-      sumLat += g[0];
-      sumLon += g[1];
+      minLat = math.min(minLat, g[0]);
+      maxLat = math.max(maxLat, g[0]);
+      minLon = math.min(minLon, g[1]);
+      maxLon = math.max(maxLon, g[1]);
       final depth = postickDepth(widget.app.rho, d.freqs[z.fi]).toStringAsFixed(0);
+      final info =
+          '${tr('site')} ${d.sites[si]} • ${z.v.toStringAsFixed(1)} mV • ${d.freqs[z.fi].toStringAsFixed(0)} Hz • ~$depth ${tr('m_unit')}';
       markers.add(Marker(
-        markerId: MarkerId('site_${d.sites[si]}'),
-        position: pos,
-        // hue 240 = blue (low voltage / water) ... hue 0 = red (high voltage / dry)
-        icon: BitmapDescriptor.defaultMarkerWithHue(240.0 * (1 - t)),
-        infoWindow: InfoWindow(
-          title: '${tr('site')} ${d.sites[si]}',
-          snippet: '${z.v.toStringAsFixed(1)} mV • ${d.freqs[z.fi].toStringAsFixed(0)} Hz • ~$depth ${tr('m_unit')}',
+        point: pos,
+        width: 34,
+        height: 34,
+        child: GestureDetector(
+          onTap: () => widget.toast(info),
+          child: Container(
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: coolwarm(t),
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 2),
+              boxShadow: const [BoxShadow(blurRadius: 3, color: Colors.black38)],
+            ),
+            child: Text('${d.sites[si]}',
+                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black87)),
+          ),
         ),
       ));
     }
     if (pts.isEmpty) return Center(child: Text(tr('no_maps_data')));
-    return GoogleMap(
-      initialCameraPosition: CameraPosition(target: LatLng(sumLat / pts.length, sumLon / pts.length), zoom: 17),
-      mapType: MapType.hybrid,
-      markers: markers,
-      polylines: {Polyline(polylineId: const PolylineId('line'), points: pts, width: 3, color: Colors.white)},
-      zoomControlsEnabled: true,
-      myLocationButtonEnabled: false,
-      gestureRecognizers: <Factory<OneSequenceGestureRecognizer>>{
-        Factory<OneSequenceGestureRecognizer>(() => EagerGestureRecognizer()),
-      },
-    );
+    final span = math.max(maxLat - minLat, (maxLon - minLon) * math.cos(((minLat + maxLat) / 2) * math.pi / 180));
+    final zoom = span < 1e-6 ? 18.0 : (math.log(360 / span) / math.ln2 - 1).clamp(2.0, 19.0).toDouble();
+    return Stack(children: [
+      FlutterMap(
+        options: MapOptions(
+          initialCenter: LatLng((minLat + maxLat) / 2, (minLon + maxLon) / 2),
+          initialZoom: zoom,
+          minZoom: 2,
+          maxZoom: 19,
+        ),
+        children: [
+          TileLayer(
+            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.geopulse.geopulse',
+          ),
+          PolylineLayer(polylines: [Polyline(points: pts, strokeWidth: 3, color: Colors.black54)]),
+          MarkerLayer(markers: markers),
+        ],
+      ),
+      Positioned(
+        right: 4,
+        bottom: 4,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+          color: Colors.white70,
+          child: const Text('© OpenStreetMap contributors', style: TextStyle(fontSize: 9, color: Colors.black87)),
+        ),
+      ),
+    ]);
   }
 
   List<Widget> _mapSection(SurveyData d, String name) {
+    final app = widget.app;
     final zones = d.bestZones();
     final target = zones.isEmpty ? null : zones.first;
-    final showGps = gpsView && d.hasGps;
+    final showMap = mapView && d.hasGps;
     final mapH = d.freqs.length <= 12 ? 340.0 : math.min(d.freqs.length * 14.0, 560.0);
+    final heatImage = smooth ? app.heatSmooth : app.heatNearest;
     String zoneText(Zone z) => tr('zone_item')
         .replaceAll('{s}', '${d.sites[z.si]}')
         .replaceAll('{f}', d.freqs[z.fi].toStringAsFixed(0))
-        .replaceAll('{d}', postickDepth(widget.app.rho, d.freqs[z.fi]).toStringAsFixed(0))
+        .replaceAll('{d}', postickDepth(app.rho, d.freqs[z.fi]).toStringAsFixed(0))
         .replaceAll('{u}', tr('m_unit'))
         .replaceAll('{v}', z.v.toStringAsFixed(1));
 
@@ -1565,18 +1764,31 @@ class _MapPageState extends State<MapPage> {
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const Icon(Icons.landscape, color: Color(0xFF8D5A1B)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(tr('est_soil').replaceAll('{r}', d.rho.toStringAsFixed(0)),
+                    style: Theme.of(context).textTheme.titleMedium),
+              ),
+            ]),
+            if (app.soilKey != 'auto')
+              Text(tr('manual_used').replaceAll('{r}', app.rho.toStringAsFixed(0)),
+                  style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 6),
             Text(tr('soil'), style: Theme.of(context).textTheme.titleSmall),
             DropdownButton<String>(
               isExpanded: true,
-              value: widget.app.soilKey,
+              value: app.soilKey,
               items: [
+                DropdownMenuItem(value: 'auto', child: Text(tr('soil_auto'))),
                 for (final e in soilRho.entries)
                   DropdownMenuItem(
                       value: e.key,
                       child: Text('${tr('soil_${e.key}')} • ${e.value.toStringAsFixed(0)} Ω·m')),
                 DropdownMenuItem(
                     value: 'custom',
-                    child: Text('${tr('soil_custom')} • ${widget.app.customRho.toStringAsFixed(0)} Ω·m')),
+                    child: Text('${tr('soil_custom')} • ${app.customRho.toStringAsFixed(0)} Ω·m')),
               ],
               onChanged: (v) {
                 if (v != null) _pickSoil(v);
@@ -1594,14 +1806,25 @@ class _MapPageState extends State<MapPage> {
               ButtonSegment(value: false, label: Text(tr('view_heat')), icon: const Icon(Icons.grid_on)),
               ButtonSegment(value: true, label: Text(tr('view_gps')), icon: const Icon(Icons.map)),
             ],
-            selected: {gpsView},
-            onSelectionChanged: (s) => setState(() => gpsView = s.first),
+            selected: {mapView},
+            onSelectionChanged: (s) => setState(() => mapView = s.first),
           ),
         ),
-      if (showGps) ...[
-        SizedBox(height: 360, child: ClipRRect(borderRadius: BorderRadius.circular(8), child: _gpsWidget(d))),
+      if (showMap) ...[
+        SizedBox(
+          height: 360,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Listener(
+              onPointerDown: (_) => _setLock(true),
+              onPointerUp: (_) => _setLock(false),
+              onPointerCancel: (_) => _setLock(false),
+              child: _osmWidget(d),
+            ),
+          ),
+        ),
         const SizedBox(height: 8),
-        ColorBarLegend(data: d),
+        ColorBarLegend(min: d.min, max: d.max),
       ] else ...[
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
@@ -1623,7 +1846,7 @@ class _MapPageState extends State<MapPage> {
             color: Colors.white,
             padding: const EdgeInsets.all(8),
             child: Column(children: [
-              Text('$name • ${widget.app.soilLabel}',
+              Text('$name • ${app.soilLabel}',
                   style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87)),
               const SizedBox(height: 6),
               Listener(
@@ -1642,9 +1865,12 @@ class _MapPageState extends State<MapPage> {
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTapDown: (t) => _pick(d, t.localPosition, size),
-                          child: CustomPaint(
-                            size: size,
-                            painter: HeatmapPainter(d, smooth, selSi, selFi, widget.app.rho, target: target),
+                          // own layer: pan/zoom only moves the cached picture, no repaint
+                          child: RepaintBoundary(
+                            child: CustomPaint(
+                              size: size,
+                              painter: HeatmapPainter(d, heatImage, smooth, selSi, selFi, app.rho, target: target),
+                            ),
                           ),
                         ),
                       ),
@@ -1653,7 +1879,7 @@ class _MapPageState extends State<MapPage> {
                 ),
               ),
               const SizedBox(height: 8),
-              ColorBarLegend(data: d),
+              ColorBarLegend(min: d.min, max: d.max),
             ]),
           ),
         ),
@@ -1668,7 +1894,7 @@ class _MapPageState extends State<MapPage> {
             subtitle: Text(zoneText(target)),
           ),
         ),
-      if (!showGps)
+      if (!showMap)
         Card(
           child: ListTile(
             leading: const Icon(Icons.touch_app),
@@ -1677,7 +1903,7 @@ class _MapPageState extends State<MapPage> {
                 : tr('picked')
                     .replaceAll('{s}', '${d.sites[selSi!]}')
                     .replaceAll('{f}', d.freqs[selFi!].toStringAsFixed(0))
-                    .replaceAll('{d}', postickDepth(widget.app.rho, d.freqs[selFi!]).toStringAsFixed(0))
+                    .replaceAll('{d}', postickDepth(app.rho, d.freqs[selFi!]).toStringAsFixed(0))
                     .replaceAll('{u}', tr('m_unit'))
                     .replaceAll('{v}', d.matrix[selFi!][selSi!].toStringAsFixed(1))),
           ),
@@ -1713,7 +1939,7 @@ class _MapPageState extends State<MapPage> {
           ]),
         ),
       ),
-      if (!showGps) ...[
+      if (!showMap) ...[
         const SizedBox(height: 8),
         SizedBox(
           height: 52,
@@ -1783,13 +2009,18 @@ class _MapPageState extends State<MapPage> {
               SizedBox(
                 height: 56,
                 child: FilledButton.icon(
-                  onPressed: () async {
-                    final err = await app.generateMap();
-                    setState(_resetSel);
-                    widget.toast(err);
-                  },
-                  icon: const Icon(Icons.grid_on),
-                  label: Text(tr('generate_map'), style: const TextStyle(fontSize: 18)),
+                  onPressed: app.loadingMap
+                      ? null
+                      : () async {
+                          final err = await app.generateMap();
+                          setState(_resetSel);
+                          widget.toast(err);
+                        },
+                  icon: app.loadingMap
+                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.grid_on),
+                  label: Text(app.loadingMap ? tr('processing') : tr('generate_map'),
+                      style: const TextStyle(fontSize: 18)),
                 ),
               ),
               const SizedBox(height: 8),
@@ -1813,8 +2044,6 @@ class VolumePage extends StatefulWidget {
 
 class _VolumePageState extends State<VolumePage> {
   double yaw = 0.6, pitch = 0.5, zoom = 1.0, baseZoom = 1.0, cutoff = 1.0, opacity = 0.9;
-  Volume3D? _vol;
-  VolumeGrid? _grid;
   bool _lock = false;
 
   @override
@@ -1833,11 +2062,8 @@ class _VolumePageState extends State<VolumePage> {
     return ListenableBuilder(
       listenable: app,
       builder: (context, _) {
-        if (app.volume != _vol) {
-          _vol = app.volume;
-          _grid = _vol == null ? null : VolumeGrid.fromVolume(_vol!);
-        }
-        final vol = _vol, grid = _grid;
+        final vol = app.volume, grid = app.volumeGrid;
+        final rho = vol == null ? 50.0 : app.rhoFor(vol.rho);
         String pocket = '';
         if (vol != null) {
           final c = vol.lowestCell();
@@ -1845,7 +2071,7 @@ class _VolumePageState extends State<VolumePage> {
               .replaceAll('{l}', '${vol.lines[c[0]]}')
               .replaceAll('{s}', '${vol.sites[c[2]]}')
               .replaceAll('{f}', vol.freqs[c[1]].toStringAsFixed(0))
-              .replaceAll('{d}', postickDepth(app.rho, vol.freqs[c[1]]).toStringAsFixed(0))
+              .replaceAll('{d}', postickDepth(rho, vol.freqs[c[1]]).toStringAsFixed(0))
               .replaceAll('{u}', tr('m_unit'));
         }
         return ListView(
@@ -1874,13 +2100,25 @@ class _VolumePageState extends State<VolumePage> {
             SizedBox(
               height: 56,
               child: FilledButton.icon(
-                onPressed: () async => widget.toast(await app.buildVolume()),
-                icon: const Icon(Icons.view_in_ar),
-                label: Text(tr('build_3d'), style: const TextStyle(fontSize: 18)),
+                onPressed: app.loadingVol ? null : () async => widget.toast(await app.buildVolume()),
+                icon: app.loadingVol
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.view_in_ar),
+                label: Text(app.loadingVol ? tr('processing') : tr('build_3d'),
+                    style: const TextStyle(fontSize: 18)),
               ),
             ),
             const SizedBox(height: 12),
             if (vol != null && grid != null) ...[
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.landscape, color: Color(0xFF8D5A1B)),
+                  title: Text(tr('est_soil').replaceAll('{r}', vol.rho.toStringAsFixed(0))),
+                  subtitle: app.soilKey == 'auto'
+                      ? null
+                      : Text(tr('manual_used').replaceAll('{r}', rho.toStringAsFixed(0))),
+                ),
+              ),
               Listener(
                 onPointerDown: (_) => _setLock(true),
                 onPointerUp: (_) => _setLock(false),
@@ -1897,9 +2135,12 @@ class _VolumePageState extends State<VolumePage> {
                         yaw += d.focalPointDelta.dx * 0.01;
                         pitch = (pitch - d.focalPointDelta.dy * 0.01).clamp(-1.4, 1.4).toDouble();
                       }),
-                      child: CustomPaint(
-                        size: Size.infinite,
-                        painter: Volume3DPainter(grid, vol, yaw, pitch, zoom, cutoff, opacity, app.rho),
+                      // own layer: the page around it is not repainted while rotating
+                      child: RepaintBoundary(
+                        child: CustomPaint(
+                          size: Size.infinite,
+                          painter: Volume3DPainter(grid, vol, yaw, pitch, zoom, cutoff, opacity, rho),
+                        ),
                       ),
                     ),
                   ),
@@ -1921,7 +2162,7 @@ class _VolumePageState extends State<VolumePage> {
               Slider(value: cutoff, min: 0.05, max: 1.0, onChanged: (v) => setState(() => cutoff = v)),
               Text(tr('opacity')),
               Slider(value: opacity, min: 0.1, max: 1.0, onChanged: (v) => setState(() => opacity = v)),
-              ColorBarLegend(data: SurveyData(0, const [], const [], const [], const {}, vol.min, vol.max, 0)),
+              ColorBarLegend(min: vol.min, max: vol.max),
               const SizedBox(height: 8),
               Card(
                 color: Colors.cyan.shade50,
